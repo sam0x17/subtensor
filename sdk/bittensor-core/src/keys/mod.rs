@@ -215,7 +215,7 @@ impl PairT for WipingEd25519Pair {
                         ("Ed25519HDKD", &*seed.0, chain_code)
                             .using_encoded(sp_core::hashing::blake2_256),
                     );
-                    seed.0.copy_from_slice(&derived);
+                    seed.0.copy_from_slice(&derived[..]);
                 }
             }
         }
