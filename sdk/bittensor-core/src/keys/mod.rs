@@ -8,7 +8,6 @@
 // the norm here, and this crate never runs inside the runtime.
 #![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
-use codec::Encode;
 use ed25519_zebra::{SigningKey, VerificationKey};
 #[cfg(feature = "host")]
 use sodiumoxide::crypto::box_;
@@ -166,6 +165,8 @@ impl AsMut<[u8]> for WipingSeed {
     }
 }
 
+const HDKD_PREIMAGE_LEN: usize = 1 + 11 + 32 + 32;
+
 /// Internal Ed25519 derivation owner. Both its seed and expanded signing key
 /// erase themselves on every return, error, panic, and final drop path.
 struct WipingEd25519Pair {
@@ -211,10 +212,16 @@ impl PairT for WipingEd25519Pair {
             match junction {
                 DeriveJunction::Soft(_) => return Err(DeriveError::SoftKeyInPath),
                 DeriveJunction::Hard(chain_code) => {
-                    let derived = Zeroizing::new(
-                        ("Ed25519HDKD", &*seed.0, chain_code)
-                            .using_encoded(sp_core::hashing::blake2_256),
-                    );
+                    // The SCALE encoding of ("Ed25519HDKD", seed, chain_code):
+                    // compact length 11 (0x2c), the label, then both arrays.
+                    // A fixed wiping buffer replaces `using_encoded`, whose
+                    // temporary heap Vec would hold the parent seed unwiped.
+                    let mut preimage = Zeroizing::new([0u8; HDKD_PREIMAGE_LEN]);
+                    preimage[0] = 0x2c;
+                    preimage[1..12].copy_from_slice(b"Ed25519HDKD");
+                    preimage[12..44].copy_from_slice(&seed.0[..]);
+                    preimage[44..].copy_from_slice(&chain_code);
+                    let derived = Zeroizing::new(sp_core::hashing::blake2_256(&preimage[..]));
                     seed.0.copy_from_slice(&derived[..]);
                 }
             }
@@ -658,8 +665,16 @@ mod tests {
 
     #[test]
     fn ed25519_signing_object_has_a_wiping_owner_and_keeps_chain_bytes() {
-        assert!(std::mem::needs_drop::<Zeroizing<SigningKey>>());
-        assert!(std::mem::needs_drop::<Keypair>());
+        // The stored variant must be the wiping owner; this fails to compile
+        // if `KeypairInner::Ed25519` reverts to a non-wiping pair type.
+        fn stored(inner: &KeypairInner) -> Option<&Zeroizing<SigningKey>> {
+            match inner {
+                KeypairInner::Ed25519(secret) => Some(secret),
+                _ => None,
+            }
+        }
+        let keypair = Keypair::from_uri("//Alice", CRYPTO_ED25519).unwrap();
+        assert!(stored(&keypair.inner).is_some());
 
         let seed = hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
             .unwrap();
@@ -671,6 +686,30 @@ mod tests {
         assert_eq!(
             hex::encode(keypair.sign(b"").unwrap()),
             "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+        );
+    }
+
+    #[test]
+    fn zeroize_clears_every_signing_key_secret() {
+        use zeroize::Zeroize;
+        let mut key = SigningKey::from([7u8; 32]);
+        key.zeroize();
+        // Zebra's derived Zeroize clears the seed, expanded scalar and nonce
+        // prefix; the seed is the observable remainder.
+        assert_eq!(<[u8; 32]>::from(key), [0u8; 32]);
+    }
+
+    #[test]
+    fn hard_derivation_keeps_substrate_vectors() {
+        let alice = Keypair::from_uri("//Alice", CRYPTO_ED25519).unwrap();
+        assert_eq!(
+            hex::encode(alice.public_key_bytes()),
+            "88dc3417d5058ec4b4503e0c12ea1a0a89be200fe98922423d4334014fa6b0ee"
+        );
+        let bob = Keypair::from_uri("//Bob", CRYPTO_ED25519).unwrap();
+        assert_eq!(
+            hex::encode(bob.public_key_bytes()),
+            "d17c2d7823ebf260fd138f2d7e27d114c0145d968b5ff5006125f2414fadae69"
         );
     }
 }
