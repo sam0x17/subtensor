@@ -9,11 +9,11 @@ use schnorrkel::{PublicKey, SecretKey};
 use scrypt::{scrypt, Params as ScryptParams};
 use serde::Deserialize;
 use sodiumoxide::crypto::secretbox::{self, Key, Nonce};
-use sp_core::{ed25519, Pair as PairT};
+use sp_core::Pair as PairT;
 use zeroize::Zeroizing;
 
 use crate::error::CoreError;
-use crate::keys::{Keypair, KeypairInner, CRYPTO_SR25519, DEFAULT_SS58_FORMAT};
+use crate::keys::{Keypair, KeypairInner, WipingEd25519Pair, CRYPTO_SR25519, DEFAULT_SS58_FORMAT};
 
 const PKCS8_HEADER: &[u8] = &[48, 83, 2, 1, 1, 48, 5, 6, 3, 43, 101, 112, 4, 34, 4, 32];
 const PKCS8_DIVIDER: &[u8] = &[161, 35, 3, 33, 0];
@@ -168,14 +168,14 @@ pub fn create_from_encrypted_json(json_data: &str, passphrase: &str) -> Result<K
         Keypair::from_private_key(&secret_hex, CRYPTO_SR25519)
     } else if json_data.encoding.content.iter().any(|c| c == "ed25519") {
         let seed = &private_key[..32];
-        let pair = ed25519::Pair::from_seed_slice(seed).map_err(|error| {
+        let pair = WipingEd25519Pair::from_seed_slice(seed).map_err(|error| {
             value_err(format!("invalid ed25519 seed in encrypted JSON: {error:?}"))
         })?;
         if pair.public().0 != public_key {
             return Err(value_err("ed25519 public key mismatch in encrypted JSON"));
         }
         Ok(Keypair::from_inner(
-            KeypairInner::Ed25519(pair),
+            KeypairInner::Ed25519(pair.into_secret()),
             DEFAULT_SS58_FORMAT,
         ))
     } else {
@@ -188,7 +188,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use sp_core::{ed25519, Pair as PairT};
+    use sp_core::Pair as PairT;
 
     fn pkcs8_payload(secret: &[u8; SEC_LENGTH], public: &[u8; PUB_LENGTH]) -> Vec<u8> {
         let mut out =
@@ -202,7 +202,7 @@ mod tests {
 
     fn build_passphrase_ed25519_json(uri: &str, passphrase: &str) -> String {
         sodiumoxide::init().unwrap();
-        let pair = ed25519::Pair::from_string(uri, None).expect("valid uri");
+        let pair = WipingEd25519Pair::from_string(uri, None).expect("valid uri");
         let raw = pair.to_raw_vec();
         let mut secret = [0u8; SEC_LENGTH];
         secret[..32].copy_from_slice(&raw);
@@ -238,8 +238,11 @@ mod tests {
     #[test]
     fn ed25519_passphrase_import_roundtrip() {
         let uri = "//Alice";
-        let pair = ed25519::Pair::from_string(uri, None).expect("valid uri");
-        let expected = Keypair::from_inner(KeypairInner::Ed25519(pair), DEFAULT_SS58_FORMAT);
+        let pair = WipingEd25519Pair::from_string(uri, None).expect("valid uri");
+        let expected = Keypair::from_inner(
+            KeypairInner::Ed25519(pair.into_secret()),
+            DEFAULT_SS58_FORMAT,
+        );
         let json = build_passphrase_ed25519_json(uri, "test-passphrase");
         let kp = create_from_encrypted_json(&json, "test-passphrase").expect("import");
         assert_eq!(kp.ss58_address(), expected.ss58_address());
