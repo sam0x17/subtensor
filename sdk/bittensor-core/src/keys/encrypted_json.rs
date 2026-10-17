@@ -45,14 +45,18 @@ fn pad_right(mut data: Vec<u8>, total_len: usize, pad_byte: u8) -> Vec<u8> {
     data
 }
 
-fn pair_from_ed25519_secret_key(secret: &[u8]) -> Result<([u8; 64], [u8; 32]), CoreError> {
+fn pair_from_ed25519_secret_key(
+    secret: &[u8],
+) -> Result<(Zeroizing<[u8; 64]>, [u8; 32]), CoreError> {
     let secret_key = SecretKey::from_ed25519_bytes(secret)
         .map_err(|_| value_err("invalid ed25519 secret key in encrypted JSON"))?;
     let public_key: PublicKey = secret_key.to_public();
-    Ok((secret_key.to_bytes(), public_key.to_bytes()))
+    Ok((Zeroizing::new(secret_key.to_bytes()), public_key.to_bytes()))
 }
 
-fn decode_pkcs8(ciphertext: &[u8]) -> Result<([u8; SEC_LENGTH], [u8; PUB_LENGTH]), CoreError> {
+fn decode_pkcs8(
+    ciphertext: &[u8],
+) -> Result<(Zeroizing<[u8; SEC_LENGTH]>, [u8; PUB_LENGTH]), CoreError> {
     let min_len = PKCS8_HEADER.len() + SEC_LENGTH + PKCS8_DIVIDER.len() + PUB_LENGTH;
     if ciphertext.len() < min_len {
         return Err(value_err("decrypted PKCS8 payload too short"));
@@ -64,7 +68,7 @@ fn decode_pkcs8(ciphertext: &[u8]) -> Result<([u8; SEC_LENGTH], [u8; PUB_LENGTH]
     }
     current_offset += PKCS8_HEADER.len();
     let secret_key = &ciphertext[current_offset..current_offset + SEC_LENGTH];
-    let mut secret_key_array = [0u8; SEC_LENGTH];
+    let mut secret_key_array = Zeroizing::new([0u8; SEC_LENGTH]);
     secret_key_array.copy_from_slice(secret_key);
     current_offset += SEC_LENGTH;
     let divider = &ciphertext[current_offset..current_offset + PKCS8_DIVIDER.len()];
@@ -160,11 +164,11 @@ pub fn create_from_encrypted_json(json_data: &str, passphrase: &str) -> Result<K
     let (private_key, public_key) = decode_pkcs8(&decrypted_data)?;
 
     if json_data.encoding.content.iter().any(|c| c == "sr25519") {
-        let (secret, derived_public_key) = pair_from_ed25519_secret_key(&private_key)?;
+        let (secret, derived_public_key) = pair_from_ed25519_secret_key(&private_key[..])?;
         if public_key != derived_public_key {
             return Err(value_err("sr25519 public key mismatch in encrypted JSON"));
         }
-        let secret_hex = Zeroizing::new(hex::encode(secret));
+        let secret_hex = Zeroizing::new(hex::encode(&secret[..]));
         Keypair::from_private_key(&secret_hex, CRYPTO_SR25519)
     } else if json_data.encoding.content.iter().any(|c| c == "ed25519") {
         let seed = &private_key[..32];
