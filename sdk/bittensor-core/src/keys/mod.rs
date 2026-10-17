@@ -8,13 +8,18 @@
 // the norm here, and this crate never runs inside the runtime.
 #![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
+use codec::Encode;
+use ed25519_zebra::{SigningKey, VerificationKey};
 #[cfg(feature = "host")]
 use sodiumoxide::crypto::box_;
 #[cfg(feature = "host")]
 use sodiumoxide::crypto::sealedbox;
 #[cfg(feature = "host")]
 use sodiumoxide::crypto::sign::ed25519 as sign_ed25519;
-use sp_core::crypto::{AccountId32, Pair as PairT, Ss58Codec};
+use sp_core::crypto::{
+    AccountId32, CryptoType, DeriveError, DeriveJunction, Pair as PairT, SecretStringError,
+    Ss58Codec,
+};
 use sp_core::{ed25519, sr25519, ByteArray};
 use zeroize::Zeroizing;
 
@@ -108,14 +113,22 @@ fn ed25519_to_x25519_pk(public_key: &[u8; 32]) -> Result<box_::PublicKey, CoreEr
         .map_err(|_| crypto_err("failed to convert ed25519 public key to x25519"))
 }
 
+fn ed25519_seed(pair: &Zeroizing<SigningKey>) -> &[u8] {
+    let pair: &SigningKey = pair;
+    pair.as_ref()
+}
+
+fn ed25519_public(pair: &Zeroizing<SigningKey>) -> [u8; 32] {
+    let pair: &SigningKey = pair;
+    VerificationKey::from(pair).into()
+}
+
 #[cfg(feature = "host")]
 fn ed25519_x25519_from_pair(
-    pair: &ed25519::Pair,
+    pair: &Zeroizing<SigningKey>,
 ) -> Result<(box_::PublicKey, box_::SecretKey), CoreError> {
     ensure_sodium()?;
-    let seed_bytes = pair.to_raw_vec();
-    let seed = sign_ed25519::Seed::from_slice(&seed_bytes)
-        .or_else(|| sign_ed25519::Seed::from_slice(&seed_bytes[..32.min(seed_bytes.len())]))
+    let seed = sign_ed25519::Seed::from_slice(ed25519_seed(pair))
         .ok_or_else(|| crypto_err("failed to derive x25519 keypair for decryption"))?;
     let (pk, sk) = sign_ed25519::keypair_from_seed(&seed);
     let x25519_pk = sign_ed25519::to_curve25519_pk(&pk)
@@ -125,11 +138,116 @@ fn ed25519_x25519_from_pair(
     Ok((x25519_pk, x25519_sk))
 }
 
+struct WipingSeed(Zeroizing<[u8; 32]>);
+
+impl Default for WipingSeed {
+    fn default() -> Self {
+        Self(Zeroizing::new([0; 32]))
+    }
+}
+
+impl Clone for WipingSeed {
+    fn clone(&self) -> Self {
+        let mut clone = Self::default();
+        clone.as_mut().copy_from_slice(self.as_ref());
+        clone
+    }
+}
+
+impl AsRef<[u8]> for WipingSeed {
+    fn as_ref(&self) -> &[u8] {
+        &self.0[..]
+    }
+}
+
+impl AsMut<[u8]> for WipingSeed {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.0[..]
+    }
+}
+
+/// Internal Ed25519 derivation owner. Both its seed and expanded signing key
+/// erase themselves on every return, error, panic, and final drop path.
+struct WipingEd25519Pair {
+    secret: Zeroizing<SigningKey>,
+}
+
+impl WipingEd25519Pair {
+    fn into_secret(self) -> Zeroizing<SigningKey> {
+        self.secret
+    }
+
+    fn seed(&self) -> WipingSeed {
+        let mut seed = WipingSeed::default();
+        seed.as_mut().copy_from_slice(ed25519_seed(&self.secret));
+        seed
+    }
+}
+
+impl CryptoType for WipingEd25519Pair {
+    type Pair = Self;
+}
+
+impl PairT for WipingEd25519Pair {
+    type Public = ed25519::Public;
+    type Seed = WipingSeed;
+    type Signature = ed25519::Signature;
+
+    fn from_seed_slice(seed: &[u8]) -> Result<Self, SecretStringError> {
+        let secret =
+            SigningKey::try_from(seed).map_err(|_| SecretStringError::InvalidSeedLength)?;
+        Ok(Self {
+            secret: Zeroizing::new(secret),
+        })
+    }
+
+    fn derive<Iter: Iterator<Item = DeriveJunction>>(
+        &self,
+        path: Iter,
+        _seed: Option<Self::Seed>,
+    ) -> Result<(Self, Option<Self::Seed>), DeriveError> {
+        let mut seed = self.seed();
+        for junction in path {
+            match junction {
+                DeriveJunction::Soft(_) => return Err(DeriveError::SoftKeyInPath),
+                DeriveJunction::Hard(chain_code) => {
+                    let derived = Zeroizing::new(
+                        ("Ed25519HDKD", &*seed.0, chain_code)
+                            .using_encoded(sp_core::hashing::blake2_256),
+                    );
+                    seed.0.copy_from_slice(&derived);
+                }
+            }
+        }
+        Ok((Self::from_seed(&seed), Some(seed)))
+    }
+
+    fn public(&self) -> Self::Public {
+        ed25519::Public::from_raw(ed25519_public(&self.secret))
+    }
+
+    fn sign(&self, message: &[u8]) -> Self::Signature {
+        Self::Signature::from_raw(self.secret.sign(message).to_bytes())
+    }
+
+    fn verify<M: AsRef<[u8]>>(
+        signature: &Self::Signature,
+        message: M,
+        public: &Self::Public,
+    ) -> bool {
+        ed25519::Pair::verify(signature, message, public)
+    }
+
+    fn to_raw_vec(&self) -> Vec<u8> {
+        ed25519_seed(&self.secret).to_vec()
+    }
+}
+
 // Each Keypair holds exactly one variant; the size skew between ed25519 and
 // public-only is irrelevant here.
 #[allow(clippy::large_enum_variant)]
 pub enum KeypairInner {
-    Ed25519(ed25519::Pair),
+    Ed25519(Zeroizing<SigningKey>),
     Sr25519(sr25519::Pair),
     PublicOnly {
         public_key: [u8; 32],
@@ -140,7 +258,7 @@ pub enum KeypairInner {
 impl KeypairInner {
     fn private_key_bytes(&self) -> Option<Vec<u8>> {
         match self {
-            KeypairInner::Ed25519(pair) => Some(pair.to_raw_vec()),
+            KeypairInner::Ed25519(pair) => Some(ed25519_seed(pair).to_vec()),
             KeypairInner::Sr25519(pair) => Some(pair.to_raw_vec()),
             KeypairInner::PublicOnly { .. } => None,
         }
@@ -217,12 +335,15 @@ impl Keypair {
             CRYPTO_SR25519 => {
                 let (pair, seed) = sr25519::Pair::from_phrase(mnemonic, password)
                     .map_err(|e| crypto_err(format!("invalid mnemonic: {e:?}")))?;
-                (KeypairInner::Sr25519(pair), seed.to_vec())
+                (KeypairInner::Sr25519(pair), Zeroizing::new(seed.to_vec()))
             }
             CRYPTO_ED25519 => {
-                let (pair, seed) = ed25519::Pair::from_phrase(mnemonic, password)
+                let (pair, seed) = WipingEd25519Pair::from_phrase(mnemonic, password)
                     .map_err(|e| crypto_err(format!("invalid mnemonic: {e:?}")))?;
-                (KeypairInner::Ed25519(pair), seed.to_vec())
+                (
+                    KeypairInner::Ed25519(pair.into_secret()),
+                    Zeroizing::new(seed.as_ref().to_vec()),
+                )
             }
             other => return Err(crypto_err(format!("unknown crypto type {other}"))),
         };
@@ -235,7 +356,7 @@ impl Keypair {
             mnemonic: password
                 .is_none()
                 .then(|| Zeroizing::new(mnemonic.to_string())),
-            seed: Some(Zeroizing::new(seed)),
+            seed: Some(seed),
         })
     }
 
@@ -247,8 +368,9 @@ impl Keypair {
                     .map_err(|e| crypto_err(format!("invalid seed: {e:?}")))?,
             ),
             CRYPTO_ED25519 => KeypairInner::Ed25519(
-                ed25519::Pair::from_seed_slice(seed)
-                    .map_err(|e| crypto_err(format!("invalid seed: {e:?}")))?,
+                WipingEd25519Pair::from_seed_slice(seed)
+                    .map_err(|e| crypto_err(format!("invalid seed: {e:?}")))?
+                    .into_secret(),
             ),
             other => return Err(crypto_err(format!("unknown crypto type {other}"))),
         };
@@ -268,8 +390,9 @@ impl Keypair {
                     .map_err(|e| crypto_err(format!("invalid secret uri: {e:?}")))?,
             ),
             CRYPTO_ED25519 => KeypairInner::Ed25519(
-                ed25519::Pair::from_string(uri, None)
-                    .map_err(|e| crypto_err(format!("invalid secret uri: {e:?}")))?,
+                WipingEd25519Pair::from_string(uri, None)
+                    .map_err(|e| crypto_err(format!("invalid secret uri: {e:?}")))?
+                    .into_secret(),
             ),
             other => return Err(crypto_err(format!("unknown crypto type {other}"))),
         };
@@ -303,9 +426,13 @@ impl Keypair {
                 } else {
                     return Err(crypto_err("ed25519 private key must be at least 32 bytes"));
                 };
-                KeypairInner::Ed25519(ed25519::Pair::from_seed_slice(seed).map_err(|error| {
-                    crypto_err(format!("invalid ed25519 private key: {error:?}"))
-                })?)
+                KeypairInner::Ed25519(
+                    WipingEd25519Pair::from_seed_slice(seed)
+                        .map_err(|error| {
+                            crypto_err(format!("invalid ed25519 private key: {error:?}"))
+                        })?
+                        .into_secret(),
+                )
             }
             other => return Err(crypto_err(format!("unknown crypto type {other}"))),
         };
@@ -349,7 +476,7 @@ impl Keypair {
 
     pub fn public_key_bytes(&self) -> [u8; 32] {
         match &self.inner {
-            KeypairInner::Ed25519(pair) => pair.public().0,
+            KeypairInner::Ed25519(pair) => ed25519_public(pair),
             KeypairInner::Sr25519(pair) => pair.public().0,
             KeypairInner::PublicOnly { public_key, .. } => *public_key,
         }
@@ -390,7 +517,7 @@ impl Keypair {
     /// Sign a message; returns the raw 64-byte signature.
     pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, CoreError> {
         match &self.inner {
-            KeypairInner::Ed25519(pair) => Ok(as_bytes(&pair.sign(message))),
+            KeypairInner::Ed25519(pair) => Ok(pair.sign(message).to_bytes().to_vec()),
             KeypairInner::Sr25519(pair) => Ok(as_bytes(&pair.sign(message))),
             KeypairInner::PublicOnly { .. } => {
                 Err(crypto_err("no private key set to create signatures"))
@@ -527,5 +654,23 @@ mod tests {
         let kp = Keypair::from_uri("//Alice", CRYPTO_SR25519).unwrap();
         let sig = kp.sign(b"<Bytes>hello</Bytes>").unwrap();
         assert!(kp.verify(b"hello", &sig).unwrap());
+    }
+
+    #[test]
+    fn ed25519_signing_object_has_a_wiping_owner_and_keeps_chain_bytes() {
+        assert!(std::mem::needs_drop::<Zeroizing<SigningKey>>());
+        assert!(std::mem::needs_drop::<Keypair>());
+
+        let seed = hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+            .unwrap();
+        let keypair = Keypair::from_seed(&seed, CRYPTO_ED25519).unwrap();
+        assert_eq!(
+            hex::encode(keypair.public_key_bytes()),
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+        );
+        assert_eq!(
+            hex::encode(keypair.sign(b"").unwrap()),
+            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+        );
     }
 }
