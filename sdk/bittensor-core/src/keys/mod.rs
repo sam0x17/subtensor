@@ -531,7 +531,7 @@ impl Keypair {
                     ));
                 }
                 let expanded = Zeroizing::new(phrase.to_seed(password.unwrap_or("")));
-                let seed = expanded[..32].to_vec();
+                let seed = Zeroizing::new(expanded[..32].to_vec());
                 (
                     KeypairInner::Mldsa(MldsaKeypair::from_seed(&seed, crypto_type)?),
                     seed,
@@ -555,7 +555,7 @@ impl Keypair {
                     .map_err(|e| crypto_err(format!("invalid mnemonic: {e:?}")))?;
                 (
                     KeypairInner::Hashed(HashedKeypair::from_seed(&seed, crypto_type)?),
-                    seed.to_vec(),
+                    Zeroizing::new(seed.to_vec()),
                 )
             }
             other => return Err(crypto_err(format!("unknown crypto type {other}"))),
